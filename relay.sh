@@ -50,14 +50,17 @@ fi
 log "$SIDE: Stop hook 触发，读取 $(basename "$TRANSCRIPT_PATH")"
 
 # ── 提取最后一条 assistant 文本（保留换行，供 markdown 存储） ─────────────────
-# thinking 块可能比 text 块先落盘，最多重试 3 次
+# thinking 块可能比 text 块先落盘，且 Stop hook 可能在新响应写入前触发，最多重试 5 次
+
+EXPECTED_COUNT=$(jq -r ".${SIDE}_msg_count" "$STATE")
 
 LAST_TEXT=""
-for attempt in 1 2 3; do
+for attempt in 1 2 3 4 5; do
     LAST_TEXT=$(python3 << PYEOF
 import json
 
 path = """$TRANSCRIPT_PATH"""
+expected = int("""$EXPECTED_COUNT""")
 msgs = []
 
 with open(path) as fh:
@@ -84,7 +87,8 @@ with open(path) as fh:
         if texts:
             msgs.append(" ".join(texts))
 
-if msgs:
+# 只有当消息数超过已处理数时，才返回新消息（避免返回上一轮的重复内容）
+if len(msgs) > expected:
     print(msgs[-1].strip(), end="")
 PYEOF
 )
@@ -103,7 +107,20 @@ log "$SIDE: 提取到回答（${#LAST_TEXT} 字符）"
 PHASE=$(jq -r '.phase' "$STATE")
 ROUND=$(jq -r '.round' "$STATE")
 MAX=$(jq -r '.max_rounds' "$STATE")
+SEARCH_MODE=$(jq -r '.search_mode // false' "$STATE")
 TIMESTAMP=$(date '+%H:%M:%S')
+
+# 联网搜索模式：提取【最终论点】之后的内容用于注入；经典模式直接用全文
+if [[ "$SEARCH_MODE" == "true" ]]; then
+    RELAY_TEXT=$(printf '%s' "$LAST_TEXT" | python3 -c "
+import sys, re
+text = sys.stdin.read()
+m = re.search(r'【最终论点】(.*)', text, re.DOTALL)
+print(m.group(1).strip() if m else text.strip())
+")
+else
+    RELAY_TEXT="$LAST_TEXT"
+fi
 
 # ── 总结阶段处理 ──────────────────────────────────────────────────────────────
 
@@ -125,7 +142,8 @@ if [[ "$PHASE" == "summary" ]]; then
 
     log "$SIDE: 总结已保存"
 
-    jq ".summary_${SIDE} = true" "$STATE" > "${STATE}.tmp" \
+    NEW_MSG_COUNT=$(( EXPECTED_COUNT + 1 ))
+    jq ".summary_${SIDE} = true | .${SIDE}_msg_count = ${NEW_MSG_COUNT}" "$STATE" > "${STATE}.tmp" \
         && mv "${STATE}.tmp" "$STATE"
 
     SUMMARY_PRO=$(jq -r '.summary_pro' "$STATE")
@@ -161,6 +179,11 @@ fi
 
 log "$SIDE: 已追加到 $(basename "$MD_FILE")"
 
+# 记录已处理消息数，防止下次 Stop hook 重复读取同一条消息
+NEW_MSG_COUNT=$(( EXPECTED_COUNT + 1 ))
+jq ".${SIDE}_msg_count = ${NEW_MSG_COUNT}" "$STATE" > "${STATE}.tmp" \
+    && mv "${STATE}.tmp" "$STATE"
+
 # ── 更新轮次（con 说完才算一轮结束） ─────────────────────────────────────────
 
 if [[ "$SIDE" == "con" ]]; then
@@ -175,7 +198,11 @@ if [[ "$SIDE" == "con" ]]; then
             && mv "${STATE}.tmp" "$STATE"
         log "辩论阶段结束，进入总结阶段"
 
-        SUMMARY_PROMPT="辩论已结束，请做最终总结陈词：重申你的核心立场，总结最有力的论据，指出对方论点的根本缺陷。100-150字。"
+        if [[ "$SEARCH_MODE" == "true" ]]; then
+            SUMMARY_PROMPT="辩论已结束，请搜索相关数据，做最终总结陈词：重申核心立场，总结最有力的数据论据，指出对方论点的根本缺陷。最后以【最终论点】输出总结（150-200字）。"
+        else
+            SUMMARY_PROMPT="辩论已结束，请做最终总结陈词：重申你的核心立场，总结最有力的论据，指出对方论点的根本缺陷。100-150字。"
+        fi
         printf '%s' "$SUMMARY_PROMPT" > "${STATE_DIR}/relay_buf.txt"
         tmux load-buffer "${STATE_DIR}/relay_buf.txt"
         tmux paste-buffer -t "$PANE_PRO"
@@ -191,7 +218,7 @@ if [[ "$SIDE" == "con" ]]; then
     fi
 fi
 
-# ── 注入对方 pane（换行替换为空格，保证单行稳定粘贴） ────────────────────────
+# ── 注入对方 pane（含对方论点和研究指令） ────────────────────────────────────
 
 if [[ "$SIDE" == "pro" ]]; then
     TARGET="$PANE_CON"
@@ -201,7 +228,14 @@ fi
 
 log "$SIDE → $([ "$SIDE" = "pro" ] && echo "反方" || echo "正方") 注入中..."
 
-printf '%s' "${LAST_TEXT//$'\n'/ }" > "${STATE_DIR}/relay_buf.txt"
+if [[ "$SEARCH_MODE" == "true" ]]; then
+    printf '%s' "【对方论点】
+${RELAY_TEXT}
+
+请先用 WebSearch 搜索反驳数据，最后以【最终论点】输出你的结论（150-200字）。" > "${STATE_DIR}/relay_buf.txt"
+else
+    printf '%s' "${RELAY_TEXT//$'\n'/ }" > "${STATE_DIR}/relay_buf.txt"
+fi
 tmux load-buffer "${STATE_DIR}/relay_buf.txt"
 tmux paste-buffer -t "$TARGET"
 sleep 0.3

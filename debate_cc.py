@@ -3,9 +3,11 @@
 Claude Code 辩论系统
 两个 claude 实例通过 Stop hook 轮流辩论，tmux 左右分屏展示
 
-用法: python3 debate_cc.py <辩题> [轮次=5]
+用法: python3 debate_cc.py <辩题> [轮次=5] [--search]
 示例: python3 debate_cc.py "人工智能弊大于利" 5
+      python3 debate_cc.py "人工智能弊大于利" 5 --search
 """
+import argparse
 import subprocess
 import sys
 import os
@@ -18,9 +20,9 @@ SESSION   = "cc_debate"
 STATE_DIR = ""
 
 
-# ── 系统提示 ──────────────────────────────────────────────────────────────────
+# ── 系统提示（经典模式） ──────────────────────────────────────────────────────
 
-SYSTEM_PROMPTS = {
+SYSTEM_PROMPTS_CLASSIC = {
     "pro": """\
 你是辩论赛的正方辩手。
 你的立场：支持辩题。
@@ -28,7 +30,6 @@ SYSTEM_PROMPTS = {
 规则：
 - 每次发言 100-150 字，观点明确、论据充分
 - 直接反驳对方的具体论点，并补充新论据
-- 只输出辩论内容，不要使用任何工具，不要读写文件
 - 不要加任何前缀标签，直接说论点
 - 用中文辩论""",
 
@@ -39,8 +40,39 @@ SYSTEM_PROMPTS = {
 规则：
 - 每次发言 100-150 字，观点明确、论据充分
 - 直接反驳对方的具体论点，并补充新论据
-- 只输出辩论内容，不要使用任何工具，不要读写文件
 - 不要加任何前缀标签，直接说论点
+- 用中文辩论""",
+}
+
+# ── 系统提示（联网搜索模式） ──────────────────────────────────────────────────
+
+SYSTEM_PROMPTS_SEARCH = {
+    "pro": """\
+你是辩论赛的正方辩手，立场：支持辩题。
+
+每次发言流程：
+1. 用 WebSearch 搜索支持你立场的数据、统计数字、专家观点
+2. 如需分析数据可使用 Bash
+3. 整合研究结果，以【最终论点】开头，用150-200字输出最终辩论内容
+
+注意：
+- 只有【最终论点】之后的内容会传给对方辩手，其余是你的研究过程
+- 必须引用具体数字、来源或案例，不得空泛陈述
+- 直接反驳对方具体论点
+- 用中文辩论""",
+
+    "con": """\
+你是辩论赛的反方辩手，立场：反对辩题。
+
+每次发言流程：
+1. 用 WebSearch 搜索反驳对方立场的数据、统计数字、专家观点
+2. 如需分析数据可使用 Bash
+3. 整合研究结果，以【最终论点】开头，用150-200字输出最终辩论内容
+
+注意：
+- 只有【最终论点】之后的内容会传给对方辩手，其余是你的研究过程
+- 必须引用具体数字、来源或案例，不得空泛陈述
+- 直接反驳对方具体论点
 - 用中文辩论""",
 }
 
@@ -97,7 +129,7 @@ def _restore_stop_hook(settings_path: str, original: str | None) -> None:
 
 # ── 初始化 ────────────────────────────────────────────────────────────────────
 
-def init_state(topic: str, max_rounds: int) -> None:
+def init_state(topic: str, max_rounds: int, search_mode: bool) -> None:
     import datetime, re
     if os.path.exists(STATE_DIR):
         shutil.rmtree(STATE_DIR)
@@ -115,18 +147,21 @@ def init_state(topic: str, max_rounds: int) -> None:
         "topic": topic,
         "round": 0,
         "max_rounds": max_rounds,
+        "search_mode": search_mode,
         "phase": "debate",    # "debate" | "summary"
         "summary_pro": False,
         "summary_con": False,
         "done": False,
         "md_pro": md_pro,
         "md_con": md_con,
+        "pro_msg_count": 0,
+        "con_msg_count": 0,
     }
     with open(f"{STATE_DIR}/state.json", "w") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def setup_instance(side: str, topic: str, relay_script: str) -> str:
+def setup_instance(side: str, topic: str, relay_script: str, search_mode: bool) -> str:
     """
     为每个辩手创建独立工作目录：
       {STATE_DIR}/{side}/
@@ -141,11 +176,14 @@ def setup_instance(side: str, topic: str, relay_script: str) -> str:
     _install_stop_hook(f"{inst_dir}/.claude/settings.json", relay_script)
 
     # 系统提示文件（含辩题）
-    full_prompt = f"辩题：{topic}\n\n" + SYSTEM_PROMPTS[side]
+    prompts = SYSTEM_PROMPTS_SEARCH if search_mode else SYSTEM_PROMPTS_CLASSIC
+    full_prompt = f"辩题：{topic}\n\n" + prompts[side]
     with open(f"{inst_dir}/system_prompt.txt", "w") as f:
         f.write(full_prompt)
 
     # 启动脚本：用 Python 传参，完全避免 shell 引号转义问题
+    claude_flags = ["--dangerously-skip-permissions"] if search_mode else []
+    flags_repr = repr(claude_flags)
     start_py = f"""\
 #!/usr/bin/env python3
 import os
@@ -156,7 +194,8 @@ os.chdir(inst_dir)
 with open(f"{{inst_dir}}/system_prompt.txt") as fh:
     prompt = fh.read()
 
-os.execvp("claude", ["claude", "--system-prompt", prompt])
+extra_flags = {flags_repr}
+os.execvp("claude", ["claude"] + extra_flags + ["--system-prompt", prompt])
 """
     start_path = f"{inst_dir}/start.py"
     with open(start_path, "w") as f:
@@ -198,13 +237,22 @@ def send_initial_prompt_async(pane: str, prompt: str, delay: int = 5) -> None:
 # ── 主流程 ────────────────────────────────────────────────────────────────────
 
 def main():
-    if len(sys.argv) < 2:
-        print("用法: python3 debate_cc.py <辩题> [轮次=5]")
-        print('示例: python3 debate_cc.py "人工智能弊大于利" 5')
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Claude Code 辩论系统",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+示例:
+  python3 debate_cc.py "人工智能弊大于利" 5          # 经典模式（纯文本）
+  python3 debate_cc.py "人工智能弊大于利" 5 --search # 联网搜索模式""",
+    )
+    parser.add_argument("topic", help="辩题")
+    parser.add_argument("rounds", nargs="?", type=int, default=5, help="辩论轮次（默认5）")
+    parser.add_argument("--search", action="store_true", help="启用联网搜索模式，辩手可调用 WebSearch/Bash 工具")
+    args = parser.parse_args()
 
-    topic      = sys.argv[1]
-    max_rounds = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+    topic       = args.topic
+    max_rounds  = args.rounds
+    search_mode = args.search
 
     global STATE_DIR
     script_dir   = os.path.dirname(os.path.abspath(__file__))
@@ -215,14 +263,16 @@ def main():
         print(f"❌  找不到 relay.sh: {relay_script}")
         sys.exit(1)
 
+    mode_label = "联网搜索模式" if search_mode else "经典模式"
     print(f"\n🎭  辩题：{topic}")
     print(f"📊  轮次：{max_rounds} 轮（正反各一次为一轮）")
+    print(f"🔧  模式：{mode_label}")
     print(f"⏳  启动 tmux 分屏，正方就绪后自动发送开场提示...\n")
 
     # 1. 初始化状态 & 实例目录（Stop hook 写入各自 .claude/settings.json）
-    init_state(topic, max_rounds)
-    setup_instance("pro", topic, relay_script)
-    setup_instance("con", topic, relay_script)
+    init_state(topic, max_rounds, search_mode)
+    setup_instance("pro", topic, relay_script, search_mode)
+    setup_instance("con", topic, relay_script, search_mode)
 
     try:
     #    ┌─────────────────────────────┐
@@ -275,7 +325,11 @@ tmux kill-session -t "{SESSION}" 2>/dev/null || true
         tmux_send("0.2", f"python3 {STATE_DIR}/con/start.py")
 
         # 5. 后台等待正方就绪后自动发送开场提示
-        send_initial_prompt_async("0.1", "请开始你的开场陈述，阐明你的立场和主要论据。")
+        if search_mode:
+            opening = "请先用 WebSearch 搜索相关数据，然后开始你的开场陈述，最后以【最终论点】输出你的立场和主要论据（150-200字）。"
+        else:
+            opening = "请开始你的开场陈述，阐明你的立场和主要论据。"
+        send_initial_prompt_async("0.1", opening)
 
         # 6. 立刻进入 tmux
         tmux("select-pane", "-t", f"{SESSION}:0.1")
