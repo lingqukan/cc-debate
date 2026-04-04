@@ -11,9 +11,10 @@
 import json
 import re
 import sys
+from typing import Optional
 
 
-def extract_last_text(path: str, expected_count: int) -> str | None:
+def extract_last_text(path: str, expected_count: int) -> Optional[str]:
     """
     从 transcript 文件中提取最后一条 assistant 消息。
 

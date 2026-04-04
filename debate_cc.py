@@ -14,6 +14,9 @@ import os
 import json
 import shutil
 import time
+import datetime
+import re
+import threading
 
 SESSION   = "cc_debate"
 # 运行时由 main() 根据脚本位置设定，这里先占位
@@ -106,31 +109,9 @@ def _install_stop_hook(settings_path: str, relay_script: str) -> str | None:
     return original
 
 
-def _restore_stop_hook(settings_path: str, original: str | None) -> None:
-    """辩论结束后恢复 settings.json 原始状态"""
-    try:
-        if original is None:
-            # 原来不存在，删除我们写入的 Stop key
-            if os.path.exists(settings_path):
-                with open(settings_path) as f:
-                    data = json.load(f)
-                data.pop("Stop", None)
-                if data:
-                    with open(settings_path, "w") as f:
-                        json.dump(data, f, indent=2)
-                else:
-                    os.remove(settings_path)
-        else:
-            with open(settings_path, "w") as f:
-                f.write(original)
-    except Exception as e:
-        print(f"⚠️  恢复 settings.json 失败: {e}")
-
-
 # ── 初始化 ────────────────────────────────────────────────────────────────────
 
 def init_state(topic: str, max_rounds: int, search_mode: bool) -> None:
-    import datetime, re
     if os.path.exists(STATE_DIR):
         shutil.rmtree(STATE_DIR)
     os.makedirs(STATE_DIR)
@@ -219,13 +200,10 @@ def tmux_send(pane: str, text: str, enter: bool = True) -> None:
 
 
 
-
 def send_initial_prompt_async(pane: str, prompt: str, delay: int = 5) -> None:
     """后台线程：等 claude 启动后发送初始 prompt，不阻塞主进程。
     用固定延迟代替字符检测——'>' 在 shell/history 中也会出现，不可靠。
     """
-    import threading
-
     def _worker():
         time.sleep(delay)
         tmux_send(pane, prompt)

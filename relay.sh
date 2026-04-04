@@ -77,10 +77,8 @@ fi
 
 log "$SIDE: 提取到回答（${#LAST_TEXT} 字符）"
 
-PHASE=$(jq -r '.phase' "$STATE")
-ROUND=$(jq -r '.round' "$STATE")
-MAX=$(jq -r '.max_rounds' "$STATE")
-SEARCH_MODE=$(jq -r '.search_mode // false' "$STATE")
+# 一次读取多个状态值，减少 IO
+read -r PHASE ROUND MAX SEARCH_MODE <<< "$(jq -r '[.phase, .round, .max_rounds, (.search_mode // false)] | @sh' "$STATE" | tr -d "'")"
 TIMESTAMP=$(date '+%H:%M:%S')
 
 # 联网搜索模式：提取【最终论点】之后的内容用于注入；经典模式直接用全文
