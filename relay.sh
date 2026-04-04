@@ -18,6 +18,13 @@ log() {
     echo "[$(date '+%H:%M:%S')] $1" >> "$LOG"
 }
 
+# ── 工具函数：原子更新 state.json ─────────────────────────────────────────────
+
+update_state() {
+    local filter="$1"
+    jq "$filter" "$STATE" > "${STATE}.tmp" && mv "${STATE}.tmp" "$STATE"
+}
+
 # ── 读取 hook payload（stdin） ────────────────────────────────────────────────
 
 INPUT=$(cat)
@@ -53,45 +60,11 @@ log "$SIDE: Stop hook 触发，读取 $(basename "$TRANSCRIPT_PATH")"
 # thinking 块可能比 text 块先落盘，且 Stop hook 可能在新响应写入前触发，最多重试 5 次
 
 EXPECTED_COUNT=$(jq -r ".${SIDE}_msg_count" "$STATE")
+EXTRACT_SCRIPT="${SCRIPT_DIR}/extract_text.py"
 
 LAST_TEXT=""
 for attempt in 1 2 3 4 5; do
-    LAST_TEXT=$(python3 << PYEOF
-import json
-
-path = """$TRANSCRIPT_PATH"""
-expected = int("""$EXPECTED_COUNT""")
-msgs = []
-
-with open(path) as fh:
-    for line in fh:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        if obj.get("type") != "assistant":
-            continue
-
-        content = obj.get("message", {}).get("content", [])
-        texts = [
-            block["text"]
-            for block in content
-            if isinstance(content, list)
-            and block.get("type") == "text"
-            and block.get("text", "").strip()
-        ]
-        if texts:
-            msgs.append(" ".join(texts))
-
-# 只有当消息数超过已处理数时，才返回新消息（避免返回上一轮的重复内容）
-if len(msgs) > expected:
-    print(msgs[-1].strip(), end="")
-PYEOF
-)
+    LAST_TEXT=$(python3 "$EXTRACT_SCRIPT" "$TRANSCRIPT_PATH" "$EXPECTED_COUNT")
     [[ -n "$LAST_TEXT" ]] && break
     log "$SIDE: attempt ${attempt} 未提取到文本，等待重试..."
     sleep 1
@@ -112,12 +85,7 @@ TIMESTAMP=$(date '+%H:%M:%S')
 
 # 联网搜索模式：提取【最终论点】之后的内容用于注入；经典模式直接用全文
 if [[ "$SEARCH_MODE" == "true" ]]; then
-    RELAY_TEXT=$(printf '%s' "$LAST_TEXT" | python3 -c "
-import sys, re
-text = sys.stdin.read()
-m = re.search(r'【最终论点】(.*)', text, re.DOTALL)
-print(m.group(1).strip() if m else text.strip())
-")
+    RELAY_TEXT=$(printf '%s' "$LAST_TEXT" | python3 "$EXTRACT_SCRIPT" --final-argument)
 else
     RELAY_TEXT="$LAST_TEXT"
 fi
@@ -143,15 +111,13 @@ if [[ "$PHASE" == "summary" ]]; then
     log "$SIDE: 总结已保存"
 
     NEW_MSG_COUNT=$(( EXPECTED_COUNT + 1 ))
-    jq ".summary_${SIDE} = true | .${SIDE}_msg_count = ${NEW_MSG_COUNT}" "$STATE" > "${STATE}.tmp" \
-        && mv "${STATE}.tmp" "$STATE"
+    update_state ".summary_${SIDE} = true | .${SIDE}_msg_count = ${NEW_MSG_COUNT}"
 
     SUMMARY_PRO=$(jq -r '.summary_pro' "$STATE")
     SUMMARY_CON=$(jq -r '.summary_con' "$STATE")
 
     if [[ "$SUMMARY_PRO" == "true" && "$SUMMARY_CON" == "true" ]]; then
-        jq '.done = true' "$STATE" > "${STATE}.tmp" \
-            && mv "${STATE}.tmp" "$STATE"
+        update_state '.done = true'
         log "双方总结完毕__DEBATE_DONE__"
     fi
 
@@ -181,21 +147,18 @@ log "$SIDE: 已追加到 $(basename "$MD_FILE")"
 
 # 记录已处理消息数，防止下次 Stop hook 重复读取同一条消息
 NEW_MSG_COUNT=$(( EXPECTED_COUNT + 1 ))
-jq ".${SIDE}_msg_count = ${NEW_MSG_COUNT}" "$STATE" > "${STATE}.tmp" \
-    && mv "${STATE}.tmp" "$STATE"
+update_state ".${SIDE}_msg_count = ${NEW_MSG_COUNT}"
 
 # ── 更新轮次（con 说完才算一轮结束） ─────────────────────────────────────────
 
 if [[ "$SIDE" == "con" ]]; then
     NEW_ROUND=$(( ROUND + 1 ))
-    jq ".round = ${NEW_ROUND}" "$STATE" > "${STATE}.tmp" \
-        && mv "${STATE}.tmp" "$STATE"
+    update_state ".round = ${NEW_ROUND}"
 
     log "con: 第 ${NEW_ROUND}/${MAX} 轮结束"
 
     if (( NEW_ROUND >= MAX )); then
-        jq '.phase = "summary"' "$STATE" > "${STATE}.tmp" \
-            && mv "${STATE}.tmp" "$STATE"
+        update_state '.phase = "summary"'
         log "辩论阶段结束，进入总结阶段"
 
         if [[ "$SEARCH_MODE" == "true" ]]; then

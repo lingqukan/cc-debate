@@ -335,8 +335,11 @@ tmux kill-session -t "{SESSION}" 2>/dev/null || true
         tmux("select-pane", "-t", f"{SESSION}:0.1")
         subprocess.run(["tmux", "attach-session", "-t", SESSION])
 
+    except KeyboardInterrupt:
+        print("\n⚠️  用户中断，正在清理...")
     finally:
-        pass  # 实例目录（含 .claude/settings.json）在下次 init_state 时整体清理
+        # 清理 tmux session（如果存在）
+        subprocess.run(["tmux", "kill-session", "-t", SESSION], stderr=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":
