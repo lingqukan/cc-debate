@@ -2,6 +2,8 @@
 
 [English](README_EN.md)
 
+![alt text](image.png)
+
 让两个 Claude Code 实例在 tmux 分屏中自动辩论。
 
 ```
